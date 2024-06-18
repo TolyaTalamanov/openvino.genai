@@ -485,6 +485,118 @@ void copy_with_left_offset(const ov::Tensor& orig, ov::Tensor& padded) {
 namespace ov {
 namespace genai {
 
+class LLMRunnerBase {
+public:
+    void set_input_tensor(const std::string& name, const ov::Tensor& tensor);
+
+    virtual ov::Tensor infer() = 0;
+    virtual void prepare_for_new_conversation() = 0;
+
+    virtual ~LLMRunnerBase() = default;
+
+protected:
+    std::unordered_map<std::string, ov::Tensor> m_input_tensors;
+};
+
+void LLMRunnerBase::set_input_tensor(const std::string& name, const ov::Tensor& tensor) {
+    m_input_tensors.emplace(name, tensor);
+}
+
+class NPULLMRunner final : public LLMRunnerBase {
+public:
+    NPULLMRunner(
+        const std::filesystem::path& path,
+        const ov::AnyMap& config,
+        int64_t pad_token_id
+    );
+
+    ov::Tensor infer() override;
+    void prepare_for_new_conversation() override;
+
+private:
+    ov::Tensor infer_prefill();
+
+private:
+    struct KVCacheDesc {
+        uint32_t total_size;
+        uint32_t num_stored_tokens;
+    };
+
+    int64_t m_pad_token_id;
+
+    KVCacheDesc m_kvcache_desc;
+    ov::InferRequest m_kvcache_request;
+    ov::InferRequest m_prefill_request;
+};
+
+NPULLMRunner::NPULLMRunner(
+    const std::filesystem::path& path,
+    const ov::AnyMap& config,
+    const int64_t pad_token_id
+) : m_pad_token_id(pad_token_id) {
+    auto kvcache_model = get_core().read_model(path / "openvino_model.xml");
+    // TODO: Add this point, there must be transformation applied to expose KV-cache from the model
+    // ov::pass::ExposeKVCacheFromModel().run_on_model(kvcache_model);
+    auto prefill_model = kvcache_model->clone();
+    prefill_model->set_friendly_name(kvcache_model->get_friendly_name() + "_prefill");
+
+    // FIXME: There must be better logic than just hardcoded values
+    m_kvcache_desc = KVCacheDesc { 1024u, 0u };
+    const uint32_t max_prompt_size = m_kvcache_desc.total_size;
+    const uint32_t max_kvcache_size = m_kvcache_desc.total_size;
+
+    reshape_to_static(prefill_model, max_kvcache_size, max_kvcache_size);
+    reshape_to_static(kvcache_model, 1u, max_kvcache_size);
+    kvcache_model = add_slices_to_kvcache_inputs(kvcache_model);
+    std::map<std::string, std::string> cfg = { {"NPU_USE_NPUW", "YES"},
+                                               {"NPU_COMPILATION_MODE_PARAMS", "compute-layers-with-higher-precision=Sqrt,Power,ReduceMean,Add" },
+                                               {"NPUW_FOLD", "YES"},
+                                               {"NPUW_DCOFF_TYPE", "f16"},
+                                               {"NPUW_DCOFF_SCALE", "YES"},
+                                               {"NPUW_ONLINE_PIPELINE", "NONE"} };
+
+    ov::AnyMap properties{cfg.begin(), cfg.end()};
+    m_prefill_request = get_core().compile_model(prefill_model, "NPU", properties).create_infer_request();
+    m_kvcache_request = get_core().compile_model(kvcache_model, "NPU", properties).create_infer_request();
+
+    prepare_for_new_conversation();
+}
+
+void NPULLMRunner::prepare_for_new_conversation() {
+    fill_tensor(m_prefill_request.get_tensor("input_ids"), m_pad_token_id);
+    fill_tensor(m_prefill_request.get_tensor("position_ids"), 0u);
+    fill_tensor(m_prefill_request.get_tensor("attention_mask"), 0u);
+    fill_tensor(m_kvcache_request.get_tensor("attention_mask"), 0u);
+    m_kvcache_desc.num_stored_tokens = 0u;
+}
+
+ov::Tensor NPULLMRunner::infer_prefill(const ov::Tensor& input_ids,
+                                       const ov::Tensor& attention_mask) {
+    auto padded_input_ids = m_prefill_request.get_tensor("input_ids");
+    copy_with_left_offset(input_ids, padded_input_ids);
+
+    auto padded_attention_mask = m_prefill_request.get_tensor("attention_mask");
+    copy_with_left_offset(attention_mask, padded_attention_mask);
+
+    auto padded_position_ids = m_prefill_request.get_tensor("position_ids");
+    auto* padded_pos_data = padded_position_ids.data<int64_t>();
+    std::iota(padded_pos_data + (m_kvcache_desc.total_size - prompt_len + 1), padded_pos_data + padded_position_ids.get_size(), 0u);
+
+    m_prefill_request.infer();
+    return m_prefill_request.get_tensor("logits");
+}
+
+ov::Tensor NPULLMRunner::infer() {
+    const auto input_ids = m_input_tensors.at("input_ids");
+    const auto attention_mask = m_input_tensors.at("attention_mask");
+
+    const auto prompt_len = input_ids.get_size();
+    if (prompt_len > 1) {
+        return infer_prefill(input_ids, attention_mask);
+    }
+    return infer_kvcache();
+}
+
 class NPULLMPipelineImpl final : public LLMPipelineImplBase {
 public:
     NPULLMPipelineImpl(
