@@ -478,7 +478,7 @@ NPULLMPipelineImpl::NPULLMPipelineImpl(
     // (1) Read the template model - this will be kvcache
     auto kvcache_model = core.read_model(path / "openvino_model.xml");
     // (2) Expose KV-cache input and output layers
-    //ov::pass::StatefulToStateless().run_on_model(kvcache_model);
+    ov::pass::StatefulToStateless().run_on_model(kvcache_model);
     // (3) Clone the model - this will be prefill
     auto prefill_model = kvcache_model->clone();
     prefill_model->set_friendly_name(kvcache_model->get_friendly_name() + "_prefill");
@@ -500,8 +500,8 @@ NPULLMPipelineImpl::NPULLMPipelineImpl(
                                                {"NPUW_DCOFF_SCALE", "YES"} };
     ov::AnyMap properties{cfg.begin(), cfg.end()};
     // FIXME: It must be NPU device!!!
-    m_prefill_request = core.compile_model(prefill_model, "CPU", properties).create_infer_request();
-    m_kvcache_request = core.compile_model(kvcache_model, "CPU", properties).create_infer_request();
+    m_prefill_request = core.compile_model(prefill_model, "NPU", properties).create_infer_request();
+    m_kvcache_request = core.compile_model(kvcache_model, "NPU", properties).create_infer_request();
     // (7) Initialize tensors
     prepare_for_new_conversation();
 };
@@ -619,9 +619,10 @@ EncodedResults NPULLMPipelineImpl::generate(
 
     const auto& kvcache_compiled = m_kvcache_request.get_compiled_model();
     for (int i = 0; i < kvcache_compiled.outputs().size() - 1; ++i) {
-        const auto& input_name = kvcache_compiled.inputs()[kStartInputKVCacheLayers + i];
-        const auto& output_name = kvcache_compiled.outputs()[kStartOutputKVCacheLayers + i];
-        m_kvcache_request.set_tensor(input_name, m_kvcache_request.get_tensor(output_name));
+        const auto& input_name = kvcache_compiled.inputs()[kStartInputKVCacheLayers + i].get_any_name();
+        const auto& output_name = kvcache_compiled.outputs()[kStartOutputKVCacheLayers + i].get_any_name();
+        auto kvcache_out_tensor = m_kvcache_request.get_tensor(output_name);
+        m_kvcache_request.set_tensor(input_name, kvcache_out_tensor);
         auto prefill_tensor = m_prefill_request.get_tensor(output_name);
         auto kvcache_tensor = m_kvcache_request.get_tensor(input_name);
         prefill_tensor.copy_to(kvcache_tensor);
