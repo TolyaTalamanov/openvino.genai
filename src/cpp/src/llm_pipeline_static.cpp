@@ -77,18 +77,15 @@ void reshape_to_static(std::shared_ptr<ov::Model> model,
     model->reshape(new_shapes);
 }
 
-void fill_tensor(ov::Tensor tensor, int64_t fill_val) {
+void fill_tensor(ov::Tensor tensor, int64_t fill_val, int32_t offset = 0) {
     int64_t* tensor_data = tensor.data<int64_t>();
-    std::fill(tensor_data, tensor_data + tensor.get_size(), fill_val);
+    std::fill(tensor_data + offset, tensor_data + tensor.get_size(), fill_val);
 }
 
-void copy_with_left_offset(const ov::Tensor& orig, ov::Tensor& padded) {
-    const auto orig_size = orig.get_size();
-    const auto padded_size = padded.get_size();
-    const auto kLeftOffset = padded_size - orig_size;
+void copy_with_offset(const ov::Tensor& orig, const int32_t offset, ov::Tensor& padded) {
     int64_t* orig_data = orig.data<int64_t>();
     int64_t* padded_data = padded.data<int64_t>();
-    std::copy(orig_data, orig_data + orig_size, padded_data + kLeftOffset);
+    std::copy(orig_data, orig_data + orig.get_size(), padded_data + offset);
 }
 
 ov::AnyMap extract_config_or_default(const ov::AnyMap& config, const std::string& config_name) {
@@ -179,6 +176,14 @@ StaticLLMPipeline::StaticLLMPipeline(
 ) : StaticLLMPipeline(path, path.string(), device, config) {
 }
 
+void StaticLLMPipeline::start_chat() {
+    m_is_chat_conversation = true;
+};
+void StaticLLMPipeline::finish_chat() {
+    m_is_chat_conversation = false;
+    m_history.clear();
+};
+
 void StaticLLMPipeline::prepare_for_new_conversation() {
     fill_tensor(m_prefill_request.get_tensor("input_ids"), m_tokenizer.get_pad_token_id());
     fill_tensor(m_prefill_request.get_tensor("position_ids"), 0u);
@@ -198,9 +203,25 @@ DecodedResults StaticLLMPipeline::generate(
     }
 
     OPENVINO_ASSERT(std::holds_alternative<std::string>(inputs));
-    auto tokenized_input = m_tokenizer.encode(std::get<std::string>(inputs));
+    auto& prompt = std::get<std::string>(inputs);
+
+    if (m_is_chat_conversation) {
+        m_history.push_back({{"role", "user"}, {"content", prompt}});
+        constexpr bool add_generation_prompt = true;
+        prompt = m_tokenizer.apply_chat_template(m_history, add_generation_prompt);
+    }
+
+    auto tokenized_input = m_tokenizer.encode(prompt);
     auto encoded_results = generate(tokenized_input, config, streamer);
-    return {m_tokenizer.decode(encoded_results.tokens), encoded_results.scores};
+    DecodedResults decoded_results = {m_tokenizer.decode(encoded_results.tokens), encoded_results.scores};
+
+    if (m_is_chat_conversation) {
+        // Tail of chat template is missing in KV cache.
+        // Find the tail to concatenate it with the next input prompt.
+        auto answer = decoded_results.texts[0];
+        m_history.push_back({{"role", "assistant"}, {"content", answer}});
+    }
+    return decoded_results;
 }
 
 EncodedResults StaticLLMPipeline::generate(
@@ -245,22 +266,25 @@ EncodedResults StaticLLMPipeline::generate(
     ov::genai::EncodedResults results;
     // NB: Only batch=1 is supported now
     results.scores.resize(1u);
+    results.scores[0] = 0u;
     results.tokens.resize(1u);
 
-    // NB: Check if input prompt less than maximum size
+    // NB: Check if there is enough space in KV-cache to process input prompt
     auto prompt_len = input_ids.get_size();
     if (prompt_len > m_kvcache_desc.total_size) {
         OPENVINO_THROW("Currently static pipeline only process up to " + std::to_string(m_kvcache_desc.total_size) + " tokens");
     }
 
-    // NB: Reset tensors on every generate call - chat conversation isn't supported yet!
+    // NB: From the "generate" perspective, every prompt is treated as start of new conversation,
+    // but in case the real chat, prompt contains information about past conversation context
     prepare_for_new_conversation();
 
     auto padded_input_ids = m_prefill_request.get_tensor("input_ids");
-    copy_with_left_offset(input_ids, padded_input_ids);
+    const auto offset = padded_input_ids.get_size() - input_ids.get_size();
+    copy_with_offset(input_ids, offset, padded_input_ids);
 
     auto padded_attention_mask = m_prefill_request.get_tensor("attention_mask");
-    copy_with_left_offset(attention_mask, padded_attention_mask);
+    fill_tensor(padded_attention_mask, 1u, offset);
 
     auto padded_position_ids = m_prefill_request.get_tensor("position_ids");
     auto* padded_pos_data = padded_position_ids.data<int64_t>();
@@ -271,12 +295,12 @@ EncodedResults StaticLLMPipeline::generate(
     // NB: Now there are prompt_len tokens in KV-cache
     m_kvcache_desc.num_stored_tokens += prompt_len;
     int64_t last_token = utils::argmax(m_prefill_request.get_tensor("logits"), 0);
+    results.tokens[0].push_back(last_token);
     if (streamer_ptr && streamer_ptr->put(last_token)) {
         return results;
     }
 
     padded_attention_mask.copy_to(m_kvcache_request.get_tensor("attention_mask"));
-
 
     // Inputs: input_ids, attention_mask, position_ids, ...
     // Outputs: logits, ...
@@ -309,7 +333,6 @@ EncodedResults StaticLLMPipeline::generate(
 
         last_token = utils::argmax(m_kvcache_request.get_tensor("logits"), 0);
         results.tokens[0].push_back(last_token);
-        results.scores[0] = 0u;
 
         if (streamer_ptr && streamer_ptr->put(last_token)) {
             break;
