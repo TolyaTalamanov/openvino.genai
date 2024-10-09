@@ -10,6 +10,9 @@
 #include <chrono>
 #include <regex>
 
+// FIXME: Debug, remove
+#include <fstream>
+
 namespace {
 
 ov::genai::WhisperGenerationConfig from_config_json_if_exists(const std::filesystem::path& model_path) {
@@ -122,17 +125,90 @@ void update_past_key_value(ov::InferRequest& source,
     }
 }
 
+template <typename T>
+void print_tensor(ov::Tensor t, size_t limit) {
+    auto* ptr = t.data<T>();
+    std::cout << "[ ";
+    for (int i = 0; i < std::min(limit, t.get_size()); ++i) {
+        std::cout << ptr[i] << " ";
+    }
+    std::cout << " ]" << std::endl;
+}
+
 int64_t decode(ov::Tensor& encoder_hidden_state,
                ov::InferRequest& decoder,
                std::vector<int32_t>& input_ids,
                const ov::genai::WhisperGenerationConfig& config,
                bool do_suppress_tokens = true) {
-    // FIXME: Is this input connected with anything???
-    decoder.set_tensor("encoder_hidden_states", ov::Tensor{encoder_hidden_state});
+
+    std::vector<float> encoder_data(1* 1500 * 384, 0);
+    std::ifstream inputFile("array_data.bin", std::ios::binary);
+    inputFile.read(reinterpret_cast<char*>(encoder_data.data()), encoder_data.size() * sizeof(float));
+
+    encoder_hidden_state = ov::Tensor(ov::element::f32, {1, 1500, 384 }, encoder_data.data() );
+
+    encoder_hidden_state.copy_to(decoder.get_tensor("encoder_hidden_states"));
+    std::cout << "encoder_hidden_states: ";
+    print_tensor<float>(decoder.get_tensor("encoder_hidden_states"), 7);
+
     ov::Tensor input_ids_tensor(ov::element::i32, { 1, input_ids.size() }, input_ids.data());
     decoder.set_tensor("input_ids", input_ids_tensor);
 
+    std::vector<ov::float16> attention_mask(input_ids.size(), 1);
+    ov::Tensor attention_mask_tensor(ov::element::f16, { 1, attention_mask.size() }, attention_mask.data());
+    decoder.set_tensor("attention_mask", attention_mask_tensor);
+
+    std::cout << "DECODER INPUT" << std::endl;
+    for (auto input : decoder.get_compiled_model().inputs()) {
+        auto name = input.get_any_name();
+        auto t = decoder.get_tensor(name);
+        std::cout << name << ": ";
+        if (t.get_element_type() == ov::element::f16) {
+            print_tensor<ov::float16>(t, 7);
+        } else if (t.get_element_type() == ov::element::i32) {
+            print_tensor<int32_t>(t, 7);
+        } else {
+            print_tensor<float>(t, 7);
+        }
+    }
+
     decoder.infer();
+
+    std::cout << "DECODER OUTPUT" << std::endl;
+    std::string name = "present_key_values.0.encoder.value";
+    std::cout << name << ": ";
+    print_tensor<float>(decoder.get_tensor(name), 7);
+
+    //std::vector<std::string> names = { 
+        //"present_key_values.0.decoder.key",
+        //"present_key_values.0.decoder.value",
+        //"present_key_values.0.encoder.key",
+        //"present_key_values.0.encoder.value",
+        //"present_key_values.1.decoder.key",
+        //"present_key_values.1.decoder.value",
+        //"present_key_values.1.encoder.key",
+        //"present_key_values.1.encoder.value",
+        //"present_key_values.2.decoder.key",
+        //"present_key_values.2.decoder.value",
+        //"present_key_values.2.encoder.key",
+        //"present_key_values.2.encoder.value",
+        //"present_key_values.3.decoder.key",
+        //"present_key_values.3.decoder.value",
+        //"present_key_values.3.encoder.key",
+        //"present_key_values.3.encoder.value"
+    //};
+
+    //for (auto name : names) {
+        //auto t = decoder.get_tensor(name);
+        //std::cout << name << ": ";
+        //if (t.get_element_type() == ov::element::f16) {
+            //print_tensor<ov::float16>(t, 7);
+        //} else if (t.get_element_type() == ov::element::i32) {
+            //print_tensor<int32_t>(t, 7);
+        //} else {
+            //print_tensor<float>(t, 7);
+        //}
+    //}
 
     auto output_tensor = decoder.get_tensor("logits");
     if (do_suppress_tokens) {
@@ -155,12 +231,54 @@ int64_t decode_with_past(ov::InferRequest& decoder_with_past,
     // FIXME: Is "attention_mask" supposed to be f16?
     decoder_with_past.get_tensor("attention_mask").data<ov::float16>()[position_id-1] = 1u;
 
+    std::string name = "past_key_values.0.encoder.value";
+    std::cout << name << ": ";
+    print_tensor<float>(decoder_with_past.get_tensor(name), 7);
+
+    //std::cout << "DECODER WITH PAST INPUT" << std::endl;
+    //std::vector<std::string> names = { 
+        //"attention_mask",
+        //"position_ids",
+        //"past_key_values.0.decoder.key",
+        //"past_key_values.0.decoder.value",
+        //"past_key_values.0.encoder.key",
+        //"past_key_values.0.encoder.value",
+        //"past_key_values.1.decoder.key",
+        //"past_key_values.1.decoder.value",
+        //"past_key_values.1.encoder.key",
+        //"past_key_values.1.encoder.value",
+        //"past_key_values.2.decoder.key",
+        //"past_key_values.2.decoder.value",
+        //"past_key_values.2.encoder.key",
+        //"past_key_values.2.encoder.value",
+        //"past_key_values.3.decoder.key",
+        //"past_key_values.3.decoder.value",
+        //"past_key_values.3.encoder.key",
+        //"past_key_values.3.encoder.value"
+    //};
+    //for (auto name : names) {
+        //auto t = decoder_with_past.get_tensor(name);
+        //std::cout << name << ": ";
+        //if (t.get_element_type() == ov::element::f16) {
+            //print_tensor<ov::float16>(t, 7);
+        //} else if (t.get_element_type() == ov::element::i32) {
+            //print_tensor<int32_t>(t, 7);
+        //} else {
+            //print_tensor<float>(t, 7);
+        //}
+    //}
+
     decoder_with_past.infer();
 
     auto output_tensor = decoder_with_past.get_tensor("logits");
+    std::cout << "output: ";
+    print_tensor<float>(output_tensor, 10);
+
     suppress_tokens(output_tensor, 0, config.suppress_tokens);
 
     int64_t output_token = ov::genai::utils::argmax(output_tensor, 0);
+    //std::cout << "token: " << output_token << std::endl;
+    throw 1;
     return output_token;
 }
 
@@ -195,7 +313,6 @@ std::pair<bool, std::vector<int64_t>> full_decode(ov::Tensor& encoder_hidden_sta
     }
 
     prepare_decoder_with_past(models.decoder_with_past, models.decoder);
-
     for (size_t i = 0; i < max_new_tokens - 1; i++) {
         auto output_token =
             decode_with_past(models.decoder_with_past, output_tokens.back(), i + input_ids.size(), config);

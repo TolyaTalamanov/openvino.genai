@@ -28,9 +28,10 @@ int main(int argc, char* argv[]) try {
         return false;
     };
 
-    pipeline.generate(raw_speech, config, streamer);
+    //pipeline.generate(raw_speech, config, streamer);
+    auto ans = pipeline.generate(raw_speech, config);
 
-    std::cout << std::endl;
+    std::cout << ans << std::endl;
 } catch (const std::exception& error) {
     try {
         std::cerr << error.what() << '\n';
