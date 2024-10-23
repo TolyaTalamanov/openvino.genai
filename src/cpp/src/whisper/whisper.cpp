@@ -138,6 +138,11 @@ int64_t decode_with_past(ov::Tensor& encoder_hidden_state,
     cache_position_tensor.set_shape({1});
     cache_position_tensor.data<int64_t>()[0] = cache_position;
 
+    ov::Tensor attention_mask_tensor = decoder_with_past.get_tensor("attention_mask");
+    size_t attention_mask_size = cache_position + 1 + 1;
+    attention_mask_tensor.set_shape({1, attention_mask_size});
+    std::fill_n(attention_mask_tensor.data<float>(), attention_mask_size, 0.0f);
+
     infer_with_perf_metrics(decoder_with_past, raw_metrics);
 
     auto output_tensor = decoder_with_past.get_tensor("logits");

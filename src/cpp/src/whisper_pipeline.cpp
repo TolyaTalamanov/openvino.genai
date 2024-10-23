@@ -8,6 +8,15 @@
 #include <openvino/openvino.hpp>
 #include <variant>
 
+#include "openvino/pass/pattern/matcher.hpp"
+#include "openvino/pass/pattern/op/wrap_type.hpp"
+#include "openvino/pass/graph_rewrite.hpp"
+#include "openvino/pass/manager.hpp"
+#include "openvino/op/range.hpp"
+#include "openvino/op/greater.hpp"
+#include "openvino/op/convert.hpp"
+#include "openvino/op/parameter.hpp"
+
 #include "text_callback_streamer.hpp"
 #include "utils.hpp"
 #include "whisper/whisper.hpp"
@@ -27,6 +36,40 @@ ov::genai::OptionalWhisperGenerationConfig get_config_from_map(const ov::AnyMap&
 }
 }  // namespace
 
+
+void add_attention_mask_input(std::shared_ptr<ov::Model> model) {
+    using namespace ov::pass::pattern;
+    using namespace ov::op;
+    class AttentionMaskInput : public ov::pass::MatcherPass {
+    public:
+
+        OPENVINO_RTTI("AttentionMaskInput");
+
+        AttentionMaskInput(std::shared_ptr<ov::Model> model) {
+            auto range = wrap_type<v4::Range>();
+            auto convert1 = wrap_type<v0::Convert>({range});
+            auto greater = wrap_type<v1::Greater>({convert1, any_input()});
+            auto convert2 = wrap_type<v0::Convert>({greater});
+
+            register_matcher(
+                std::make_shared<Matcher>(convert2, this->get_type_info().name), [model](Matcher& m) {
+                    auto node = m.get_match_root();
+                    auto attention_mask = std::make_shared<v0::Parameter>(ov::element::f32, ov::PartialShape{-1, -1});
+                    attention_mask->get_output_tensor(0).set_names({"attention_mask"});
+                    model->add_parameters({attention_mask});
+                    ov::replace_node(node, attention_mask);
+                    return false;
+                }
+            );
+        }
+    };
+
+    ov::pass::Manager pm;
+    pm.register_pass<AttentionMaskInput>(model);
+    pm.run_passes(model);
+}
+
+
 namespace ov {
 namespace genai {
 
@@ -44,12 +87,13 @@ public:
 
         m_models.encoder =
             core.compile_model((models_path / "openvino_encoder_model.xml").string(), device, compile_properties)
-                .create_infer_request();
-        m_models.decoder =
-            core.compile_model((models_path / "openvino_decoder_model.xml").string(), device, compile_properties)
-                .create_infer_request();
+                               .create_infer_request();
+        m_models.decoder = core.compile_model((models_path / "openvino_decoder_model.xml").string(), device, compile_properties)
+                               .create_infer_request();
+        auto decoder_with_past_model = core.read_model(models_path / "openvino_decoder_with_past_model.xml");
+        add_attention_mask_input(decoder_with_past_model);
         m_models.decoder_with_past =
-            core.compile_model(models_path / "openvino_decoder_with_past_model.xml", device, compile_properties)
+            core.compile_model(decoder_with_past_model, device, compile_properties)
                 .create_infer_request();
 
         // If eos_token_id was not provided, take value
