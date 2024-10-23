@@ -141,6 +141,7 @@ int64_t decode_with_past(ov::Tensor& encoder_hidden_state,
     ov::Tensor attention_mask_tensor = decoder_with_past.get_tensor("attention_mask");
     size_t attention_mask_size = cache_position + 1 + 1;
     attention_mask_tensor.set_shape({1, attention_mask_size});
+    // this is an inversed mask: a multiplier for negative infinity to be added to an intermediate tensor just before the Softmax in the attention
     std::fill_n(attention_mask_tensor.data<float>(), attention_mask_size, 0.0f);
 
     infer_with_perf_metrics(decoder_with_past, raw_metrics);
