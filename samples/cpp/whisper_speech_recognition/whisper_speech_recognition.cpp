@@ -5,22 +5,23 @@
 #include "openvino/genai/whisper_pipeline.hpp"
 
 int main(int argc, char* argv[]) try {
-    if (3 > argc) {
+    if (4 > argc) {
         throw std::runtime_error(std::string{"Usage: "} + argv[0] + " <MODEL_DIR> \"<WAV_FILE_PATH>\"");
     }
 
     std::filesystem::path models_path = argv[1];
     std::string wav_file_path = argv[2];
-    std::string device = "CPU";  // GPU can be used as well
+    std::string device = argv[3];
 
     ov::genai::WhisperPipeline pipeline(models_path, device);
 
     ov::genai::WhisperGenerationConfig config(models_path / "generation_config.json");
-    config.max_new_tokens = 100;
+    config.max_new_tokens = 1000;
     // 'task' and 'language' parameters are supported for multilingual models only
     config.language = "<|en|>";  // can switch to <|zh|> for Chinese language
     config.task = "transcribe";
     config.return_timestamps = true;
+    //config.return_timestamps = false;
 
     auto streamer = [](std::string word) {
         std::cout << word;
@@ -28,7 +29,9 @@ int main(int argc, char* argv[]) try {
     };
 
     ov::genai::RawSpeechInput raw_speech = utils::audio::read_wav(wav_file_path);
-    auto result = pipeline.generate(raw_speech, config, streamer);
+    //auto result = pipeline.generate(raw_speech, config, streamer);
+    auto result = pipeline.generate(raw_speech, config);
+    std::cout << result << std::endl;
 
     std::cout << "\n";
 

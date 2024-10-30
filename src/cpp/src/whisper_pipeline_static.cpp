@@ -29,6 +29,16 @@
 namespace {
 
 template <typename T>
+void print_tensor(ov::Tensor t, size_t limit=10) {
+    auto* ptr = t.data<T>();
+    std::cout << "[ ";
+    for (int i = 0; i < std::min(limit, t.get_size()); ++i) {
+        std::cout << ptr[i] << " ";
+    }
+    std::cout << " ]" << std::endl;
+}
+
+template <typename T>
 void fill_tensor(ov::Tensor tensor, T fill_val) {
     auto* tensor_data = tensor.data<T>();
     std::fill(tensor_data, tensor_data + tensor.get_size(), fill_val);
@@ -54,6 +64,8 @@ ov::Tensor encode(ov::InferRequest& request,
                     mel_data.size(),
                     ".");
     copy_to_tensor(mel_data, request.get_tensor("input_features"));
+    std::cout << "input features: " << std::endl;
+    //print_tensor<float>(request.get_tensor("input_features"));
     request.infer();
     return request.get_tensor("last_hidden_state");
 }
@@ -82,7 +94,8 @@ void set_cross_attn_key_value(ov::InferRequest& source, ov::InferRequest& dest) 
         if (source_output_name.find("encoder") == std::string::npos) {
             continue;
         }
-        std::string with_past_input_name = std::regex_replace(source_output_name, std::regex("present"), "past_key_values");
+        std::string with_past_input_name = std::regex_replace(source_output_name, std::regex("present"), "past_key_values"); // optimum-cli
+        //std::string with_past_input_name = std::regex_replace(source_output_name, std::regex("present"), "past");
         dest.set_tensor(with_past_input_name, source.get_tensor(source_output_name));
     }
 }
@@ -103,7 +116,8 @@ void update_past_key_value(ov::InferRequest& source, ov::InferRequest& dest, con
             continue;
         }
 
-        std::string with_past_input_name = std::regex_replace(source_output_name, std::regex("present"), "past_key_values");
+        std::string with_past_input_name = std::regex_replace(source_output_name, std::regex("present"), "past_key_values"); // optimum-cli
+        //std::string with_past_input_name = std::regex_replace(source_output_name, std::regex("present"), "past");
 
         auto src_kv_tensor = source.get_tensor(source_output_name);
         auto dst_kv_tensor = dest.get_tensor(with_past_input_name);
@@ -133,9 +147,17 @@ void set_decoder_input_ids_attention_mask(ov::InferRequest& decoder,
               input_ids_data + input_ids_tensor.get_size(),
               static_cast<int32_t>(pad_token));
 
+    //std::cout << "decoder input_ids" << std::endl;
+    //print_tensor<int32_t>(input_ids_tensor);
+
     auto attention_mask_data = attention_mask_tensor.data<ov::float16>();
+    //std::cout << "attention mask shape: " << attention_mask_tensor.get_shape() << std::endl;
     std::fill_n(attention_mask_data, init_ids.size(), 1u);
     std::fill(attention_mask_data + init_ids.size(), attention_mask_data + attention_mask_tensor.get_size(), 0u);
+
+    // optimum-cli
+    //std::fill_n(attention_mask_data, init_ids.size(), 0u);
+    //std::fill(attention_mask_data + init_ids.size(), attention_mask_data + attention_mask_tensor.get_size(), 1u);
 
     //decoder.get_tensor("attention_mask").data<ov::float16>()[input_ids.size() - 1] = 0u;
     //                                                       ^ Need to used attention_mask size here!
@@ -151,9 +173,16 @@ int64_t decode(ov::Tensor& encoder_hidden_state,
     encoder_hidden_state.copy_to(decoder.get_tensor("encoder_hidden_states"));
     set_decoder_input_ids_attention_mask(decoder, init_ids, config.pad_token_id);
 
+    //std::cout << "attention_mask: " << std::endl;
+    //print_tensor<ov::float16>(decoder.get_tensor("attention_mask"));
+    //std::cout << "input_ids" << std::endl;
+    //print_tensor<int32_t>(decoder.get_tensor("input_ids"));
+
     decoder.infer();
 
+    //std::cout << "logits: " << std::endl;
     auto output_tensor = decoder.get_tensor("logits");
+    //print_tensor<float>(output_tensor);
 
     if (apply_logit_processors) {
         ov::genai::do_suppress_tokens(output_tensor, 0, config.begin_suppress_tokens);
@@ -165,6 +194,7 @@ int64_t decode(ov::Tensor& encoder_hidden_state,
     }
 
     int64_t output_token = ov::genai::utils::argmax(output_tensor, 0);
+    //std::cout << "output_token: " << output_token << std::endl;
     return output_token;
 }
 
@@ -177,10 +207,14 @@ int64_t decode_with_past(ov::InferRequest& decoder_with_past,
     // FIXME: Avoid this cast to i32. Why it's not i64 precision in model?
     decoder_with_past.get_tensor("input_ids").data<int32_t>()[0] = static_cast<int32_t>(input_id);
     // FIXME: Avoid this cast to i32. Why it's not i64 precision in model?
-    //decoder_with_past.get_tensor("position_ids").data<int32_t>()[0] = static_cast<int32_t>(position_id);
     decoder_with_past.get_tensor("cache_position").data<int64_t>()[0] = position_id; // for optimum-cli
+    //decoder_with_past.get_tensor("position_ids").data<int32_t>()[0] = static_cast<int32_t>(position_id);
     // FIXME: Is "attention_mask" supposed to be f16?
-    decoder_with_past.get_tensor("attention_mask").data<ov::float16>()[position_id - 1] = 1u;
+    //decoder_with_past.get_tensor("attention_mask").data<ov::float16>()[position_id - 1] = 1u;
+    decoder_with_past.get_tensor("attention_mask").data<ov::float16>()[position_id - 1] = 0u; // optimum-cli
+
+    //std::cout << "decoder with past attetion_mask: " << std::endl;
+    //print_tensor<ov::float16>(decoder_with_past.get_tensor("attention_mask"), decoder_with_past.get_tensor("attention_mask").get_size());
 
     decoder_with_past.infer();
 
@@ -203,6 +237,7 @@ void zero_past_key_values(ov::InferRequest& request) {
             continue;
         }
         fill_tensor<ov::float16>(request.get_tensor(past_key_value_decoder_name), 0); // for optimum-cli
+        //fill_tensor<float>(request.get_tensor(past_key_value_decoder_name), 0);
     }
 }
 
@@ -210,13 +245,19 @@ void prepare_decoder_with_past(ov::InferRequest& decoder_with_past, ov::InferReq
     // NB: Prepare attetion mask to be in a format [1, 1, 1, 0, 0, 0, 0, ..., 1]
     auto attention_mask = decoder_with_past.get_tensor("attention_mask");
     auto* attention_mask_ptr = attention_mask.data<ov::float16>();
-    std::fill(attention_mask_ptr, attention_mask_ptr + 3u, 1);
+    //std::fill(attention_mask_ptr, attention_mask_ptr + 3u, 1);
+    std::fill(attention_mask_ptr, attention_mask_ptr + 3u, 0);
     //std::fill(attention_mask_ptr + 3u, attention_mask_ptr + attention_mask.get_size() - 1, 0);
     //attention_mask_ptr[attention_mask.get_size() - 1] = 1;
     // NB: for optimum-cli models attention_mask should be [1, 1, 1, 0, 0, 0, 0, ..., 1, 0], size = size+1 :FIXME
-    std::fill(attention_mask_ptr + 3u, attention_mask_ptr + attention_mask.get_size() - 2, 0);
-    attention_mask_ptr[attention_mask.get_size() - 2] = 1;
-    attention_mask_ptr[attention_mask.get_size() - 1] = 0;
+    //
+    //std::fill(attention_mask_ptr + 3u, attention_mask_ptr + attention_mask.get_size() - 2, 0);
+    //attention_mask_ptr[attention_mask.get_size() - 2] = 1;
+    //attention_mask_ptr[attention_mask.get_size() - 1] = 0;
+    std::fill(attention_mask_ptr + 3u, attention_mask_ptr + attention_mask.get_size() - 2, 1);
+    attention_mask_ptr[attention_mask.get_size() - 2] = 0;
+    attention_mask_ptr[attention_mask.get_size() - 1] = 1;
+
     // NB: Zero past_key_values.*.decoder.value tensors
     zero_past_key_values(decoder_with_past);
     // NB: Copy KV-caches from decoder
@@ -299,7 +340,10 @@ std::pair<bool, std::vector<int64_t>> full_decode(ov::Tensor& encoder_hidden_sta
                                                   const size_t max_new_tokens,
                                                   const bool return_timestamps,
                                                   const std::shared_ptr<ov::genai::StreamerBase> streamer) {
+    //std::cout << "[DEBUG] Run decode..." << std::endl;
     int64_t output_token = decode(encoder_hidden_state, models.decoder, init_ids, config, true, return_timestamps);
+    //std::cout << "[DEBUG] Run - DONE" << std::endl;
+    //std::cout << "decoder output token: " << output_token << std::endl;
     std::vector<int64_t> output_tokens{output_token};
 
     const size_t timestamp_begin = config.no_timestamps_token_id + 1;
@@ -312,15 +356,22 @@ std::pair<bool, std::vector<int64_t>> full_decode(ov::Tensor& encoder_hidden_sta
         return {false, output_tokens};
     }
 
+    //std::cout << "[DEBUG] Prepare decoder with past..." << std::endl;
     prepare_decoder_with_past(models.decoder_with_past, models.decoder);
+    //std::cout << "[DEBUG] Prepare decoder with past - DONE" << std::endl;
 
     for (size_t i = 0; i < max_new_tokens - 1; i++) {
+        //std::cout << "[DEBUG] Rund decoder with past..." << std::endl;
         auto output_token = decode_with_past(models.decoder_with_past,
                                              output_tokens.back(),
                                              i + init_ids.size(),
                                              config,
                                              return_timestamps,
                                              output_tokens);
+
+        //std::cout << "output_token: " << output_token << std::endl;
+
+        //std::cout << "[DEBUG] Rund decoder with past - DONE" << std::endl;
         update_past_key_value(models.decoder_with_past, models.decoder_with_past, i + init_ids.size());
 
         if (output_token == config.eos_token_id) {
@@ -542,56 +593,54 @@ WhisperPipeline::StaticWhisperPipeline::StaticWhisperPipeline(const std::filesys
     auto decoder_model = core.read_model(models_path / "openvino_decoder_model.xml");
     auto decoder_with_past_model = core.read_model(models_path / "openvino_decoder_with_past_model.xml");
 
-    add_attention_mask_input_for_decoder(decoder_model);
-    add_attention_mask_input(decoder_with_past_model);
-
     // TODO: Support models produced by optimum-cli
     if (!check_decoder_model_compatibility(decoder_model)) {
-        OPENVINO_THROW("StaticWhisperPipeline expects decoder model has \"attention_mask\" input!");
+        std::cout << "[DEBUG] Found optimum-cli models, apply transformations..." << std::endl;
+        add_attention_mask_input_for_decoder(decoder_model);
+        add_attention_mask_input(decoder_with_past_model);
+        //size_t max_sequence_length = 128;
+        size_t max_sequence_length = 448;
+        reshape_to_static_encoder(encoder_model);
+        reshape_to_static(decoder_model, 4, 4);  // What is 4 here??
+        reshape_to_static(decoder_with_past_model, 1, max_sequence_length);
+        // Replace KV-tensors for the entire cache to tensors only for new token
+        decoder_with_past_model = redirect_new_kv_to_output(decoder_with_past_model);
+        preprocess_encoder(encoder_model);
+        preprocess_decoder(decoder_model);
+        preprocess_decoder(decoder_with_past_model);
+        std::cout << "[DEBUG] All model modifications are done, saving models..." << std::endl;
+        ov::save_model(encoder_model, models_path / "0_openvino_encoder_model_attn.xml");
+        ov::save_model(decoder_model, models_path / "0_openvino_decoder_model_attn.xml");
+        ov::save_model(decoder_with_past_model, models_path / "0_openvino_decoder_with_past_model_attn.xml");
+    } else {
+        std::cout << "[DEBUG] Model is already in appropriate format " << std::endl;
     }
 
     // TODO: There must be model reshape to eliminate dynamism!
-    size_t max_sequence_length = 128;
 
-    reshape_to_static_encoder(encoder_model);
-    reshape_to_static(decoder_model, 4, 4);  // What is 4 here??
-    reshape_to_static(decoder_with_past_model, 1, max_sequence_length);
+    //ov::AnyMap config_encoder = {
+        //{"NPU_COMPILATION_MODE_PARAMS", "compute-layers-with-higher-precision=Sqrt,Power,ReduceMean,Add"},
+        //{"NPU_USE_NPUW", "YES"},
+        //{"NPUW_ONLINE_PIPELINE", "NONE"},
+        ////{"NPUW_FOLD", "YES"},
+        ////{"NPUW_DCOFF_TYPE", "f16"},
+        ////{"NPUW_DCOFF_SCALE", "YES"},
+        //{"NPUW_DEVICES", "CPU"}};
 
-    // Replace KV-tensors for the entire cache to tensors only for new token
-    decoder_with_past_model = redirect_new_kv_to_output(decoder_with_past_model);
+    //ov::AnyMap config = {
+        //{"NPU_COMPILATION_MODE_PARAMS", "compute-layers-with-higher-precision=Sqrt,Power,ReduceMean,Add"},
+        //{"NPU_USE_NPUW", "YES"},
+        ////{"NPUW_FOLD", "YES"},
+        ////{"NPUW_DCOFF_TYPE", "f16"},
+        ////{"NPUW_DCOFF_SCALE", "YES"},
+        //{"NPUW_DEVICES", "CPU"}};
 
-    ov::AnyMap config_encoder = {
-        {"NPU_COMPILATION_MODE_PARAMS", "compute-layers-with-higher-precision=Sqrt,Power,ReduceMean,Add"},
-        {"NPU_USE_NPUW", "YES"},
-        {"NPUW_ONLINE_PIPELINE", "NONE"},
-        //{"NPUW_FOLD", "YES"},
-        //{"NPUW_DCOFF_TYPE", "f16"},
-        //{"NPUW_DCOFF_SCALE", "YES"},
-        {"NPUW_DEVICES", "CPU"}};
-
-    ov::AnyMap config = {
-        {"NPU_COMPILATION_MODE_PARAMS", "compute-layers-with-higher-precision=Sqrt,Power,ReduceMean,Add"},
-        {"NPU_USE_NPUW", "YES"},
-        //{"NPUW_FOLD", "YES"},
-        //{"NPUW_DCOFF_TYPE", "f16"},
-        //{"NPUW_DCOFF_SCALE", "YES"},
-        {"NPUW_DEVICES", "CPU"}};
-
-    preprocess_encoder(encoder_model);
-    preprocess_decoder(decoder_model);
-    preprocess_decoder(decoder_with_past_model);
-
-    std::cout << "[DEBUG] All model modifications are done, saving models..." << std::endl;
-    ov::save_model(encoder_model, models_path / "0_openvino_encoder_model_attn.xml");
-    ov::save_model(decoder_model, models_path / "0_openvino_decoder_model_attn.xml");
-    ov::save_model(decoder_with_past_model, models_path / "0_openvino_decoder_with_past_model_attn.xml");
-
-    m_models.encoder = core.compile_model(encoder_model, "NPU", config_encoder).create_infer_request();
+    m_models.encoder = core.compile_model(encoder_model, "CPU").create_infer_request();
     std::cout << "[DEBUG] Compile encoder model - DONE" << std::endl;
-    m_models.decoder = core.compile_model(decoder_model, "NPU", config_encoder).create_infer_request();
+    m_models.decoder = core.compile_model(decoder_model, "CPU").create_infer_request();
     std::cout << "[DEBUG] Compile decoder model - DONE" << std::endl;
     m_models.decoder_with_past =
-        core.compile_model(decoder_with_past_model, "NPU", config_encoder).create_infer_request();
+        core.compile_model(decoder_with_past_model, "CPU").create_infer_request();
     std::cout << "[DEBUG] Compile decoder with past model - DONE" << std::endl;
 
     // If eos_token_id was not provided, take value
@@ -621,6 +670,8 @@ WhisperDecodedResults WhisperPipeline::StaticWhisperPipeline::generate(
     const bool is_shortform = input_features.n_frames <= m_feature_extractor.nb_max_frames;
     // long-form audio processing requires timestamps to be enabled
     const bool return_timestamps = config.return_timestamps || !is_shortform;
+    //const bool return_timestamps = false;
+    std::cout << "[DEBUG] return_timestamps: " << std::boolalpha << return_timestamps << std::endl;
 
     size_t max_new_tokens = config.get_max_new_tokens();
 
@@ -633,6 +684,7 @@ WhisperDecodedResults WhisperPipeline::StaticWhisperPipeline::generate(
         static_cast<float>(m_feature_extractor.chunk_length) / m_model_config.max_source_positions;
     size_t segment_offset = 0;
 
+    std::cout << "[DEBUG] Start loop " << input_features.n_frames << " frames, with chunk step: " << segment_offset << std::endl;
     for (size_t chunk_offset = 0; chunk_offset < input_features.n_frames; chunk_offset += segment_offset) {
         if (output_tokens.size() >= max_new_tokens) {
             break;
@@ -641,16 +693,26 @@ WhisperDecodedResults WhisperPipeline::StaticWhisperPipeline::generate(
         auto input_features_chunk =
             input_features.get_data_with_offset(chunk_offset, m_feature_extractor.nb_max_frames);
 
+        std::cout << "[DEBUG] Run encode..." << std::endl;
         ov::Tensor hidden_state_tensor = encode(m_models.encoder,
                                                 input_features_chunk,
                                                 m_feature_extractor.feature_size,
                                                 m_feature_extractor.nb_max_frames);
 
+        std::cout << "hidden state: " << std::endl;
+        //print_tensor<float>(hidden_state_tensor);
+        //print_tensor<ov::float16>(hidden_state_tensor); // optimum-cli
+
+        std::cout << "[DEBUG] Run encode - DONE" << std::endl;
+
+        std::cout << "[DEBUG] Prepare init_ids..." << std::endl;
         // prepare init_ids just once for whole input
         if (init_ids.empty()) {
             init_ids = prepare_init_ids(hidden_state_tensor, m_models.decoder, config, return_timestamps);
         }
+        std::cout << "[DEBUG] Prepare init_ids - DONE" << std::endl;
 
+        std::cout << "[DEBUG] Run full_decode..." << std::endl;
         auto [cancelled, chunk_output_tokens] = full_decode(hidden_state_tensor,
                                                             config,
                                                             m_models,
@@ -658,6 +720,7 @@ WhisperDecodedResults WhisperPipeline::StaticWhisperPipeline::generate(
                                                             max_new_tokens - output_tokens.size(),
                                                             return_timestamps,
                                                             streamer_ptr);
+        std::cout << "[DEBUG] Run full_decode - DONE" << std::endl;
 
         if (return_timestamps) {
             auto extracted_segments = ov::genai::extract_segments(chunk_output_tokens,
@@ -684,6 +747,7 @@ WhisperDecodedResults WhisperPipeline::StaticWhisperPipeline::generate(
             break;
         }
     }
+    std::cout << "[DEBUG] Loop - DONE" << std::endl;
 
     if (streamer_ptr) {
         streamer_ptr->end();
