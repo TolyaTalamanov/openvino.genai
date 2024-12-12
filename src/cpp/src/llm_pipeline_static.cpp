@@ -672,6 +672,14 @@ StaticLLMPipeline::StaticLLMPipeline(
 ) : LLMPipelineImplBase(tokenizer,
                         utils::from_config_json_if_exists(models_path)) {
     auto properties = config;
+    //ov::AnyMap properties = {
+                                //{"NPU_USE_NPUW", "YES"},
+                                //{"NPUW_DEVICES", "CPU"},
+                                ////{"OPTIMIZE_KV_COPY", "YES"},
+                                //{"NPUW_ONLINE_PIPELINE", "NONE"},
+                                //{"PREFILL_CONFIG", { }},
+                                //{"GENERATE_CONFIG", { }}
+                            //};
     /* NB: Static LLM pipeline consists of two models,
        first to process the input prompt (prefill),
        second to use in generation loop (kvcache)
@@ -738,7 +746,9 @@ void StaticLLMPipeline::setupAndCompileModels(
     // (5) Reshape both models to static shape
     const uint32_t kMaxPromptLen = align_to(pop_int_and_cast(properties, "MAX_PROMPT_LEN").value_or(1024u), 64u);
     const uint32_t kMinResponseLen = align_to(pop_int_and_cast(properties, "MIN_RESPONSE_LEN").value_or(128u), 64u);
-    const bool optimize_kv_copy = pop_or_default<std::string>(properties, "OPTIMIZE_KV_COPY", "NO") == "YES";
+    //const bool optimize_kv_copy = pop_or_default<std::string>(properties, "OPTIMIZE_KV_COPY", "NO") == "YES";
+    const bool optimize_kv_copy = true;
+    //const bool optimize_kv_copy = false;
 
     ModelDesc model_desc = get_modeldesc_from_json(models_path / "config.json");
     KVAxesPosition axes = get_kv_axes(model_desc.type);
@@ -1064,12 +1074,16 @@ EncodedResults StaticLLMPipeline::generate(
     attention_mask_data[m_kvcache_desc.total_size - 1] = 1u;
 
     const size_t max_tokens = config.get_max_new_tokens(prompt_len);
+
+    std::vector<int> copy_time;
+    std::vector<int> set_time;
     for (int i = 0; i < max_tokens - 1; ++i) {
         input_ids_data[0] = last_token;
         position_ids_data[0] = m_kvcache_desc.num_stored_tokens;
         attention_mask_data[m_kvcache_desc.num_stored_tokens - 1] = 1u;
 
         // NB: Write KV-cache for the new token to the correct input position for the next iteration
+        auto start_set = std::chrono::steady_clock::now();
         if (m_kvcache_desc.optimize_copy) {
             const size_t kStartInputKVCacheLayers = 3u;
             for (int i = 0; i < kvcache_compiled.outputs().size() - 1; ++i) {
@@ -1082,6 +1096,8 @@ EncodedResults StaticLLMPipeline::generate(
                 m_kvcache_request.set_tensor(output_name, kvcache_in_slice);
             }
         }
+        auto end_set = std::chrono::steady_clock::now();
+        set_time.push_back(std::chrono::duration_cast<std::chrono::microseconds>(end_set-start_set).count());
 
         m_kvcache_request.infer();
         m_kvcache_desc.num_stored_tokens += 1;
@@ -1104,6 +1120,7 @@ EncodedResults StaticLLMPipeline::generate(
             break;
         }
 
+        auto start_copy = std::chrono::steady_clock::now();
         if (!m_kvcache_desc.optimize_copy) {
             // NB: Write KV-cache for the new token to the correct input position for the next iteration
             for (int i = 0; i < kvcache_compiled.outputs().size() - 1; ++i) {
@@ -1120,7 +1137,13 @@ EncodedResults StaticLLMPipeline::generate(
                 m_kvcache_request.get_tensor(output_name).copy_to(kvcache_in_slice);
             }
         }
+        auto end_copy = std::chrono::steady_clock::now();
+        copy_time.push_back(std::chrono::duration_cast<std::chrono::microseconds>(end_copy-start_copy).count());
     }
+    auto avg_copy_time = std::accumulate(copy_time.begin(), copy_time.end(), 0) / copy_time.size();
+    auto avg_set_time  = std::accumulate(set_time.begin(), set_time.end(), 0) / set_time.size();
+    std::cout << "avg copy time: " << avg_copy_time << "us" << std::endl;
+    std::cout << "avg set time: " << avg_set_time << "us" << std::endl;
     auto stop_time = std::chrono::steady_clock::now();
     // If is called without tokenization then that stat will not be reported.
     auto& metrics = results.perf_metrics;
