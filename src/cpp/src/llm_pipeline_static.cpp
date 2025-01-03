@@ -27,7 +27,58 @@
 #include "json_utils.hpp"
 #include "utils.hpp"
 
+#include <immintrin.h>
+
+#include <chrono>
+
 namespace {
+
+template <uint32_t dst_stride> void copy_value_avx(uint16_t *src_ptr, uint16_t *dst_ptr) {
+    constexpr uint32_t block_size = sizeof(__m256i) / sizeof(uint16_t);
+    constexpr uint32_t emb_size = 128;
+    for (int k = 0; k < 32 * emb_size; k += 64) {
+        __m256i src1 = _mm256_lddqu_si256((__m256i *)(src_ptr + k));
+        __m256i src2 = _mm256_lddqu_si256((__m256i *)(src_ptr + k + 16));
+        __m256i src3 = _mm256_lddqu_si256((__m256i *)(src_ptr + k + 32));
+        __m256i src4 = _mm256_lddqu_si256((__m256i *)(src_ptr + k + 48));
+        for (int j = 0; j < block_size; j++) {
+            (dst_ptr + k * dst_stride)[j * dst_stride] = src1.m256i_i16[j];
+            (dst_ptr + (k + 16) * dst_stride)[j * dst_stride] = src2.m256i_i16[j];
+            (dst_ptr + (k + 32) * dst_stride)[j * dst_stride] = src3.m256i_i16[j];
+            (dst_ptr + (k + 48) * dst_stride)[j * dst_stride] = src4.m256i_i16[j];
+        }
+    }
+}
+
+// template <uint32_t vector_size, uint32_t dst_group_stride> void copy_key(uint16_t *src_ptr, uint16_t *dst_ptr) {
+//     constexpr uint32_t block_size = sizeof(__m256i) / sizeof(uint16_t);
+//     for (int k = 0; k < 32; k++) {
+//         memcpy(dst_ptr + k * dst_group_stride, src_ptr + k * vector_size, vector_size * sizeof(uint16_t));
+//     }
+// }
+
+ov::Tensor make_tensor_slice(ov::Tensor tensor, size_t dim, size_t start_pos, size_t end_pos) {
+    ov::Shape start_shape(std::vector<size_t>(tensor.get_shape().size(), 0u));
+    start_shape[dim] = start_pos;
+    ov::Shape end_shape = tensor.get_shape();
+    end_shape[dim] = end_pos;
+    return ov::Tensor(tensor, start_shape, end_shape);
+}
+
+void copy_to(ov::Tensor src_tensor,
+             ov::Tensor dst_tensor,
+             const size_t kv_dim,
+             const size_t position) {
+    if (kv_dim == 3u) {
+        copy_value_avx<1152>(src_tensor.data<uint16_t>(),
+                             dst_tensor.data<uint16_t>() + position);
+    } else {
+        auto dst_slice = make_tensor_slice(
+            dst_tensor, kv_dim, position - 1, position
+        );
+        src_tensor.copy_to(dst_slice);
+    }
+}
 
 namespace opp = ov::pass::pattern;
 class TransposeValueTensors : public ov::pass::MatcherPass {
@@ -585,14 +636,6 @@ std::optional<uint32_t> pop_int_and_cast(ov::AnyMap& config, const std::string& 
     return std::nullopt;
 }
 
-ov::Tensor make_tensor_slice(ov::Tensor tensor, size_t dim, size_t start_pos, size_t end_pos) {
-    ov::Shape start_shape(std::vector<size_t>(tensor.get_shape().size(), 0u));
-    start_shape[dim] = start_pos;
-    ov::Shape end_shape = tensor.get_shape();
-    end_shape[dim] = end_pos;
-    return ov::Tensor(tensor, start_shape, end_shape);
-}
-
 void set_npuw_cache_dir(ov::AnyMap& config) {
     std::optional<std::string> cache_dir = get_option<std::string>(config, "CACHE_DIR");
     if (config.count("NPU_USE_NPUW") != 0u && cache_dir) {
@@ -767,7 +810,9 @@ void StaticLLMPipeline::setupAndCompileModels(
         properties, "PREFILL_CONFIG", get_default_prefill_config(prefill_model, npudesc)
     );
     // NB: GENERATE_HINT is only applicable for default generate config!
-    auto generate_hint = str_to_hint(pop_or_default<std::string>(properties, "GENERATE_HINT", to_string(GenerateHint::FAST_COMPILE)));
+    //auto generate_hint = str_to_hint(pop_or_default<std::string>(properties, "GENERATE_HINT", to_string(GenerateHint::FAST_COMPILE)));
+    std::cout << "[LOG_DEBUG] GenerateHint is hardcoded to BEST_PERFT" << std::endl;
+    auto generate_hint = GenerateHint::BEST_PERF;
     auto generate_config = pop_or_default(
         properties, "GENERATE_CONFIG", get_default_generate_config(kvcache_model, npudesc, generate_hint)
     );
@@ -1026,6 +1071,7 @@ EncodedResults StaticLLMPipeline::generate(
     // NB: Copy KV-cache tensors from prefill model to kvcache model
     const auto& kvcache_compiled = m_kvcache_request.get_compiled_model();
 
+    auto start_copy = std::chrono::steady_clock::now();
     ov::parallel_for(kvcache_compiled.outputs().size() - 1, [&](size_t i) {
         const auto& output_name = kvcache_compiled.outputs()[kStartOutputKVCacheLayers + i].get_any_name();
         const auto  input_name = std::regex_replace(output_name, std::regex("present"), "past_key_values");
@@ -1051,6 +1097,11 @@ EncodedResults StaticLLMPipeline::generate(
             prefill_out_slice.copy_to(kvcache_in_slice);
         }
     });
+    auto end_copy = std::chrono::steady_clock::now();
+    double prefill_kv_copy =
+        std::chrono::duration_cast<std::chrono::microseconds>(end_copy - start_copy).count() / 1000.0;
+
+    std::cout << "prefill copy: " << prefill_kv_copy << "ms" << std::endl;
 
     auto* input_ids_data = m_kvcache_request.get_tensor("input_ids").data<int64_t>();
     auto* position_ids_data = m_kvcache_request.get_tensor("position_ids").data<int64_t>();
@@ -1059,6 +1110,12 @@ EncodedResults StaticLLMPipeline::generate(
     // NB: Fill attention mask in the correct format [1, 1 ... 1, 0, 0 ... 0, 1]
     std::fill(attention_mask_data, attention_mask_data + m_kvcache_desc.num_stored_tokens - 1u, 1u);
     attention_mask_data[m_kvcache_desc.total_size - 1] = 1u;
+
+
+    double total_sum = 0;
+    int num_iters = 0;
+    std::vector<double> k_copy;
+    std::vector<double> v_copy;
 
     const size_t max_tokens = config.get_max_new_tokens(prompt_len);
     for (int i = 0; i < max_tokens - 1; ++i) {
@@ -1088,6 +1145,7 @@ EncodedResults StaticLLMPipeline::generate(
         }
 
         // NB: Write KV-cache for the new token to the correct input position for the next iteration
+        auto start_copy = std::chrono::steady_clock::now();
         for (int i = 0; i < kvcache_compiled.outputs().size() - 1; ++i) {
             const auto& output_name = kvcache_compiled.outputs()[kStartOutputKVCacheLayers + i].get_any_name();
             std::string input_name = std::regex_replace(output_name, std::regex("present"), "past_key_values");
@@ -1096,12 +1154,23 @@ EncodedResults StaticLLMPipeline::generate(
                 m_kvcache_desc.v_tensors_transposed) ? 3u : m_kvcache_desc.seq_len;
 
             auto kvcache_in_tensor = m_kvcache_request.get_tensor(input_name);
-            auto kvcache_in_slice = make_tensor_slice(
-                kvcache_in_tensor, kv_dim, m_kvcache_desc.num_stored_tokens - 1, m_kvcache_desc.num_stored_tokens
-            );
-            m_kvcache_request.get_tensor(output_name).copy_to(kvcache_in_slice);
+            auto out_tensor = m_kvcache_request.get_tensor(output_name);
+
+            copy_to(out_tensor, kvcache_in_tensor, kv_dim, m_kvcache_desc.num_stored_tokens);
         }
+        auto end_copy = std::chrono::steady_clock::now();
+        double kv_copy =
+            std::chrono::duration_cast<std::chrono::microseconds>(end_copy - start_copy).count() / 1000.0;
+        total_sum += kv_copy;
+        num_iters += 1;
     }
+
+    auto total_avg_latency = total_sum / num_iters;
+
+    std::cout << "num_iters: " << num_iters << std::endl;
+    std::cout << "total sum: " << total_sum << "ms" << std::endl;
+    std::cout << "total_avg_latency: " << total_avg_latency << "ms" << std::endl;
+
     auto stop_time = std::chrono::steady_clock::now();
     // If is called without tokenization then that stat will not be reported.
     auto& metrics = results.perf_metrics;
