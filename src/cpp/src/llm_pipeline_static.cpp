@@ -33,29 +33,29 @@
 
 namespace {
 
-template <uint32_t dst_stride> void copy_value_avx(uint16_t *src_ptr, uint16_t *dst_ptr) {
+template <uint32_t dst_stride>
+void copy_value_avx(const uint16_t *src_ptr,
+                          uint16_t *dst_ptr
+                    const uint32_t emb_size,
+                    const uint32_t num_channels) {
     constexpr uint32_t block_size = sizeof(__m256i) / sizeof(uint16_t);
-    constexpr uint32_t emb_size = 128;
-    for (int k = 0; k < 32 * emb_size; k += 64) {
+
+    const uint32_t num_elements = num_channels * emb_size;
+    OPENVINO_ASSERT(num_element % 64 == 0);
+
+    for (int k = 0; k < num_elements k += 64) {
         __m256i src1 = _mm256_lddqu_si256((__m256i *)(src_ptr + k));
         __m256i src2 = _mm256_lddqu_si256((__m256i *)(src_ptr + k + 16));
         __m256i src3 = _mm256_lddqu_si256((__m256i *)(src_ptr + k + 32));
         __m256i src4 = _mm256_lddqu_si256((__m256i *)(src_ptr + k + 48));
         for (int j = 0; j < block_size; j++) {
-            (dst_ptr + k * dst_stride)[j * dst_stride] = src1.m256i_i16[j];
-            (dst_ptr + (k + 16) * dst_stride)[j * dst_stride] = src2.m256i_i16[j];
-            (dst_ptr + (k + 32) * dst_stride)[j * dst_stride] = src3.m256i_i16[j];
-            (dst_ptr + (k + 48) * dst_stride)[j * dst_stride] = src4.m256i_i16[j];
+            (dst_ptr +  k       * dst_stride)[j * dst_stride] = reinterpret_cast<uint16_t*>(&src1)[j];
+            (dst_ptr + (k + 16) * dst_stride)[j * dst_stride] = reinterpret_cast<uint16_t*>(&src2)[j];
+            (dst_ptr + (k + 32) * dst_stride)[j * dst_stride] = reinterpret_cast<uint16_t*>(&src3)[j];
+            (dst_ptr + (k + 48) * dst_stride)[j * dst_stride] = reinterpret_cast<uint16_t*>(&src4)[j];
         }
     }
 }
-
-// template <uint32_t vector_size, uint32_t dst_group_stride> void copy_key(uint16_t *src_ptr, uint16_t *dst_ptr) {
-//     constexpr uint32_t block_size = sizeof(__m256i) / sizeof(uint16_t);
-//     for (int k = 0; k < 32; k++) {
-//         memcpy(dst_ptr + k * dst_group_stride, src_ptr + k * vector_size, vector_size * sizeof(uint16_t));
-//     }
-// }
 
 ov::Tensor make_tensor_slice(ov::Tensor tensor, size_t dim, size_t start_pos, size_t end_pos) {
     ov::Shape start_shape(std::vector<size_t>(tensor.get_shape().size(), 0u));
@@ -70,8 +70,9 @@ void copy_to(ov::Tensor src_tensor,
              const size_t kv_dim,
              const size_t position) {
     if (kv_dim == 3u) {
-        copy_value_avx<1152>(src_tensor.data<uint16_t>(),
-                             dst_tensor.data<uint16_t>() + position);
+        copy_value_avx<1152>(reinterpret_cast<uint16_t*>(src_tensor.data()),
+                             reinterpret_cast<uint16_t*>(dst_tensor.data()) + position,
+                             128, 32);
     } else {
         auto dst_slice = make_tensor_slice(
             dst_tensor, kv_dim, position - 1, position
@@ -286,12 +287,12 @@ enum class GenerateHint {
 
 std::string to_string(GenerateHint h) {
     switch(h) {
-        case GenerateHint::FAST_COMPILE : 
+        case GenerateHint::FAST_COMPILE :
             return "FAST_COMPILE";
-        case GenerateHint::BEST_PERF : 
+        case GenerateHint::BEST_PERF :
             return "BEST_PERF";
         default:
-            OPENVINO_THROW("Unsupported value for type GenerateHint provided");        
+            OPENVINO_THROW("Unsupported value for type GenerateHint provided");
     }
 }
 
@@ -731,7 +732,7 @@ StaticLLMPipeline::StaticLLMPipeline(
     const ov::AnyMap& properties,
     const ov::genai::GenerationConfig& generation_config
 ) : LLMPipelineImplBase(tokenizer, generation_config) {
-    
+
     bool use_blobs = false;
     auto anyopt = get_option<bool>(properties, "USE_BLOBS");
     if (anyopt.has_value()) {
@@ -768,6 +769,32 @@ void StaticLLMPipeline::setupAndCompileModels(
         8) Convert kv-cache tensors to f16 precision
         9) Compile both models
     */
+
+    std::vector<uint16_t> row = { 1, 2, 3, 4, 5 };
+    std::vector<uint16_t> out(R * C, 0u);
+
+    const int R = 7;
+    const int C = 5;
+
+    uint16_t* data = out.data();
+    for (int i = 0; i < R; ++i) {
+        for (int j = 0; j < C; ++j) {
+            std::cout << data[i * COL + j] << " ";
+        }
+        std::cout << std::endl;
+    }
+    std::cout << "\n\n" << std::endl;
+
+    ov::Tensor src();
+
+    for (int i = 0; i < R; ++i) {
+        for (int j = 0; j < C; ++j) {
+            std::cout << data[i * COL + j] << " ";
+        }
+        std::cout << std::endl;
+    }
+
+    throw 1;
 
     ov::Core core;
 
