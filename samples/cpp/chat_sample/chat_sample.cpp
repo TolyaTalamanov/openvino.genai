@@ -10,8 +10,16 @@ int main(int argc, char* argv[]) try {
     std::string prompt;
     std::string models_path = argv[1];
 
-    std::string device = "CPU";  // GPU, NPU can be used as well
-    ov::genai::LLMPipeline pipe(models_path, device);
+    ov::AnyMap properties = {
+                                {"NPU_USE_NPUW", "YES"},
+                                {"NPUW_DEVICES", "CPU"},
+                                {"NPUW_ONLINE_PIPELINE", "NONE"},
+                                {"PREFILL_CONFIG", { }},
+                                {"GENERATE_CONFIG", { }}
+                            };
+
+    std::string device = "NPU";  // GPU, NPU can be used as well
+    ov::genai::LLMPipeline pipe(models_path, device, properties);
     
     ov::genai::GenerationConfig config;
     config.max_new_tokens = 100;

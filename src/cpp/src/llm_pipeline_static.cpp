@@ -31,6 +31,91 @@
 
 namespace {
 
+void copy_value_avx(const uint16_t *src_ptr,
+                          uint16_t *dst_ptr,
+                    const uint32_t emb_size,
+                    const uint32_t num_channels,
+                    const uint32_t dst_stride) {
+    constexpr uint32_t block_size = sizeof(__m256i) / sizeof(uint16_t);
+
+    const uint32_t num_elements = num_channels * emb_size;
+    OPENVINO_ASSERT(num_elements % 64 == 0);
+
+    for (int k = 0; k < num_elements; k += 64) {
+        __m256i src1 = _mm256_lddqu_si256((__m256i *)(src_ptr + k));
+        __m256i src2 = _mm256_lddqu_si256((__m256i *)(src_ptr + k + 16));
+        __m256i src3 = _mm256_lddqu_si256((__m256i *)(src_ptr + k + 32));
+        __m256i src4 = _mm256_lddqu_si256((__m256i *)(src_ptr + k + 48));
+        for (int j = 0; j < block_size; j++) {
+            (dst_ptr +  k       * dst_stride)[j * dst_stride] = reinterpret_cast<uint16_t*>(&src1)[j];
+            (dst_ptr + (k + 16) * dst_stride)[j * dst_stride] = reinterpret_cast<uint16_t*>(&src2)[j];
+            (dst_ptr + (k + 32) * dst_stride)[j * dst_stride] = reinterpret_cast<uint16_t*>(&src3)[j];
+            (dst_ptr + (k + 48) * dst_stride)[j * dst_stride] = reinterpret_cast<uint16_t*>(&src4)[j];
+        }
+    }
+}
+
+void copy_by_rows(const ov::Tensor src_tensor,
+                  const size_t     src_start_pos,
+                  const size_t     dst_start_pos,
+                  const size_t     num_rows,
+                  ov::Tensor       dst_tensor) {
+    // NB: [1, heads, seq_len, emb_size]
+    const auto src_shape = src_tensor.get_shape();
+    const auto dst_shape = src_tensor.get_shape();
+    const auto type_size = src_tensor.get_byte_size() / src_tensor.get_size();
+
+    //std::cout << "[LOG_DEBUG] src: " << src_shape << std::endl;
+    //std::cout << "[LOG_DEBUG] dst: " << dst_shape << std::endl;
+    //std::cout << "[LOG_DEBUG] type size: " << type_size << std::endl;
+    //std::cout << "[LOG_DEUBG] num_rows: " << num_rows << std::endl;
+    //std::cout << "[LOG_DEUBG] src_start_pos: " << src_start_pos << std::endl;
+    //std::cout << "[LOG_DEUBG] dst_start_pos: " << dst_start_pos << std::endl;
+
+    OPENVINO_ASSERT(src_shape[0] == 1u);
+    OPENVINO_ASSERT(src_shape[1] == dst_shape[1]);
+    OPENVINO_ASSERT(src_shape[3] == dst_shape[3]);
+    OPENVINO_ASSERT(src_shape.size() == 4u && dst_shape.size() == 4u);
+    OPENVINO_ASSERT(src_tensor.get_element_type() == dst_tensor.get_element_type());
+
+    const auto* src_tensor_data = reinterpret_cast<uint8_t*>(src_tensor.data());
+          auto* dst_tensor_data = reinterpret_cast<uint8_t*>(dst_tensor.data());
+
+    const auto rows_stride  = src_tensor.get_strides()[2];
+    //std::cout << "[LOG_DEBUG] rows_stride: " << rows_stride << std::endl;
+
+    const auto num_heads = src_shape[1];
+    const auto emb_size  = src_shape[3];
+    const auto head_size_in_bytes = emb_size * type_size * num_rows;
+
+    //std::cout << "[LOG_DEBUG] num_heads: " << num_heads << std::endl;
+    //std::cout << "[LOG_DEBUG] emb_size: " << emb_size << std::endl;
+    //std::cout << "[LOG_DEBUG] head_size_in_bytes: " << head_size_in_bytes << std::endl;
+
+    // NB: Position of the first row
+    //std::cout << "[LOG_DEBUG] src += " << src_start_pos * rows_stride << std::endl;
+    src_tensor_data += src_start_pos * rows_stride;
+    //std::cout << "[LOG_DEBUG] dst += " << dst_start_pos * rows_stride << std::endl;
+    dst_tensor_data += dst_start_pos * rows_stride;
+
+    const auto src_heads_stride = src_tensor.get_strides()[1];
+    const auto dst_heads_stride = dst_tensor.get_strides()[1];
+    //std::cout << "[LOG_DEBUG] src_heads_stride: " << src_heads_stride << std::endl;
+    //std::cout << "[LOG_DEBUG] dst_heads_stride: " << dst_heads_stride << std::endl;
+
+    // NB: Perform continuous memory copy for every head
+    for (size_t i = 0; i < num_heads; ++i) {
+        //std::cout << "[LOG_DEBUG] copy " << head_size_in_bytes << std::endl;
+        std::copy_n(src_tensor_data, head_size_in_bytes, dst_tensor_data);
+        //std::cout << "[LOG_DEBUG] copy " << head_size_in_bytes << " - done" << std::endl;
+        // NB: Go to the next channel
+        //std::cout << "src += " << src_heads_stride << std::endl;
+        //std::cout << "dst += " << dst_heads_stride << std::endl;
+        dst_tensor_data += dst_heads_stride;
+        src_tensor_data += src_heads_stride;
+    }
+}
+
 namespace opp = ov::pass::pattern;
 class TransposeValueTensors : public ov::pass::MatcherPass {
 public:
@@ -1355,9 +1440,14 @@ EncodedResults StatelessLLMPipeline::generate(
 
         if (kv_dim == 3u) {
             copy_columns_by_row_chunks(prefill_out_slice, kvcache_in_slice);
+        } else if (kv_dim == 2u) {
+			copy_by_rows(
+				prefill_out_tensor, m_kvcache_desc.max_prompt_size - m_kvcache_desc.num_stored_tokens,
+                0u, m_kvcache_desc.num_stored_tokens, kvcache_in_tensor
+			);
         } else {
-            prefill_out_slice.copy_to(kvcache_in_slice);
-        }
+			prefill_out_slice.copy_to(kvcache_in_slice);
+		}
     });
 
     auto* input_ids_data = m_kvcache_request.get_tensor("input_ids").data<int64_t>();
@@ -1405,7 +1495,27 @@ EncodedResults StatelessLLMPipeline::generate(
             auto kvcache_in_slice = make_tensor_slice(
                 kvcache_in_tensor, kv_dim, m_kvcache_desc.num_stored_tokens - 1, m_kvcache_desc.num_stored_tokens
             );
-            m_kvcache_request.get_tensor(output_name).copy_to(kvcache_in_slice);
+
+            auto kvcache_out_tensor = m_kvcache_request.get_tensor(output_name);
+
+            if (kv_dim == 2u) {
+                copy_by_rows(
+                    kvcache_out_tensor, 0u, m_kvcache_desc.num_stored_tokens - 1, 1, kvcache_in_tensor
+                );
+            } else if (kv_dim == 3u) {
+                // NB: [1, num_heads, emb_size, kv_dim]
+                const auto shape      = kvcache_in_tensor.get_shape();
+                const auto num_heads  = shape[1];
+                const auto emb_size   = shape[2];
+                const auto dst_stride = shape[3];
+                copy_value_avx(
+                    reinterpret_cast<uint16_t*>(kvcache_out_tensor.data()),
+                    reinterpret_cast<uint16_t*>(kvcache_in_tensor.data()) + (m_kvcache_desc.num_stored_tokens - 1),
+                    emb_size, num_heads, dst_stride
+                );
+            } else {
+                kvcache_out_tensor.copy_to(kvcache_in_slice);
+            }
         }
     }
 
