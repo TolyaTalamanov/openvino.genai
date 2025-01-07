@@ -33,17 +33,17 @@
 
 namespace {
 
-template <uint32_t dst_stride>
 void copy_value_avx(const uint16_t *src_ptr,
-                          uint16_t *dst_ptr
+                          uint16_t *dst_ptr,
                     const uint32_t emb_size,
-                    const uint32_t num_channels) {
+                    const uint32_t num_channels,
+                    const uint32_t dst_stride) {
     constexpr uint32_t block_size = sizeof(__m256i) / sizeof(uint16_t);
 
     const uint32_t num_elements = num_channels * emb_size;
-    OPENVINO_ASSERT(num_element % 64 == 0);
+    OPENVINO_ASSERT(num_elements % 64 == 0);
 
-    for (int k = 0; k < num_elements k += 64) {
+    for (int k = 0; k < num_elements; k += 64) {
         __m256i src1 = _mm256_lddqu_si256((__m256i *)(src_ptr + k));
         __m256i src2 = _mm256_lddqu_si256((__m256i *)(src_ptr + k + 16));
         __m256i src3 = _mm256_lddqu_si256((__m256i *)(src_ptr + k + 32));
@@ -65,21 +65,206 @@ ov::Tensor make_tensor_slice(ov::Tensor tensor, size_t dim, size_t start_pos, si
     return ov::Tensor(tensor, start_shape, end_shape);
 }
 
+void copy_by_rows(const ov::Tensor src_tensor,
+                  const size_t     src_start_pos,
+                  const size_t     dst_start_pos,
+                  const size_t     num_rows,
+                  ov::Tensor       dst_tensor) {
+    // NB: [1, heads, seq_len, emb_size]
+    const auto src_shape = src_tensor.get_shape();
+    const auto dst_shape = src_tensor.get_shape();
+    const auto type_size = src_tensor.get_byte_size() / src_tensor.get_size();
+
+    //std::cout << "[LOG_DEBUG] src: " << src_shape << std::endl;
+    //std::cout << "[LOG_DEBUG] dst: " << dst_shape << std::endl;
+    //std::cout << "[LOG_DEBUG] type size: " << type_size << std::endl;
+    //std::cout << "[LOG_DEUBG] num_rows: " << num_rows << std::endl;
+    //std::cout << "[LOG_DEUBG] src_start_pos: " << src_start_pos << std::endl;
+    //std::cout << "[LOG_DEUBG] dst_start_pos: " << dst_start_pos << std::endl;
+
+    OPENVINO_ASSERT(src_shape[0] == 1u);
+    OPENVINO_ASSERT(src_shape[1] == dst_shape[1]);
+    OPENVINO_ASSERT(src_shape[3] == dst_shape[3]);
+    OPENVINO_ASSERT(src_shape.size() == 4u && dst_shape.size() == 4u);
+    OPENVINO_ASSERT(src_tensor.get_element_type() == dst_tensor.get_element_type());
+
+    const auto* src_tensor_data = reinterpret_cast<uint8_t*>(src_tensor.data());
+          auto* dst_tensor_data = reinterpret_cast<uint8_t*>(dst_tensor.data());
+
+    const auto rows_stride  = src_tensor.get_strides()[2];
+    //std::cout << "[LOG_DEBUG] rows_stride: " << rows_stride << std::endl;
+
+    const auto num_heads = src_shape[1];
+    const auto emb_size  = src_shape[3];
+    const auto head_size_in_bytes = emb_size * type_size * num_rows;
+
+    //std::cout << "[LOG_DEBUG] num_heads: " << num_heads << std::endl;
+    //std::cout << "[LOG_DEBUG] emb_size: " << emb_size << std::endl;
+    //std::cout << "[LOG_DEBUG] head_size_in_bytes: " << head_size_in_bytes << std::endl;
+
+    // NB: Position of the first row
+    //std::cout << "[LOG_DEBUG] src += " << src_start_pos * rows_stride << std::endl;
+    src_tensor_data += src_start_pos * rows_stride;
+    //std::cout << "[LOG_DEBUG] dst += " << dst_start_pos * rows_stride << std::endl;
+    dst_tensor_data += dst_start_pos * rows_stride;
+
+    const auto src_heads_stride = src_tensor.get_strides()[1];
+    const auto dst_heads_stride = dst_tensor.get_strides()[1];
+    //std::cout << "[LOG_DEBUG] src_heads_stride: " << src_heads_stride << std::endl;
+    //std::cout << "[LOG_DEBUG] dst_heads_stride: " << dst_heads_stride << std::endl;
+
+    // NB: Perform continuous memory copy for every head
+    for (size_t i = 0; i < num_heads; ++i) {
+        //std::cout << "[LOG_DEBUG] copy " << head_size_in_bytes << std::endl;
+        std::copy_n(src_tensor_data, head_size_in_bytes, dst_tensor_data);
+        //std::cout << "[LOG_DEBUG] copy " << head_size_in_bytes << " - done" << std::endl;
+        // NB: Go to the next channel
+        //std::cout << "src += " << src_heads_stride << std::endl;
+        //std::cout << "dst += " << dst_heads_stride << std::endl;
+        dst_tensor_data += dst_heads_stride;
+        src_tensor_data += src_heads_stride;
+    }
+}
+
 void copy_to(ov::Tensor src_tensor,
              ov::Tensor dst_tensor,
              const size_t kv_dim,
              const size_t position) {
     if (kv_dim == 3u) {
-        copy_value_avx<1152>(reinterpret_cast<uint16_t*>(src_tensor.data()),
-                             reinterpret_cast<uint16_t*>(dst_tensor.data()) + position,
-                             128, 32);
+    //if (false) {
+        //const auto shape = dst_tensor.get_shape();
+        //const auto emb_size = shape[2];
+        //const auto channels = shape[1];
+        //const auto dst_stride = shape[3];
+        //copy_value_avx(reinterpret_cast<uint16_t*>(src_tensor.data()),
+                       //reinterpret_cast<uint16_t*>(dst_tensor.data()) + position,
+                       //emb_size, channels, dst_stride);
+        auto dst_slice = make_tensor_slice(
+            dst_tensor, kv_dim, position - 1, position
+        );
+        src_tensor.copy_to(dst_slice);
     } else {
         auto dst_slice = make_tensor_slice(
             dst_tensor, kv_dim, position - 1, position
         );
         src_tensor.copy_to(dst_slice);
+        //copy_by_rows(src_tensor, 0u, position, 1, dst_tensor);
     }
 }
+
+void copy_columns_by_row_chunks(const ov::Tensor& src, ov::Tensor& dst) {
+    const auto src_shape = src.get_shape();
+
+    OPENVINO_ASSERT(src_shape.size() == 4u);
+    OPENVINO_ASSERT(src_shape == dst.get_shape());
+    OPENVINO_ASSERT(src.get_byte_size() == dst.get_byte_size());
+
+    const auto src_strides = src.get_strides();
+    const auto dst_strides = dst.get_strides();
+    const auto elem_size   = src.get_byte_size() / src.get_size();
+
+    const auto C = src_shape[1];
+    const auto H = src_shape[2];
+    const auto W = src_shape[3];
+
+    const auto IS_H = src_strides[2];
+    const auto OS_H = dst_strides[2];
+
+    const size_t chunk_byte_size = W * elem_size;
+
+    const auto* src_p  = static_cast<uint8_t*>(src.data());
+          auto* dst_p  = static_cast<uint8_t*>(dst.data());
+
+    for (size_t i = 0; i < C*H; ++i) {
+        const size_t src_offset = i * IS_H;
+        const size_t dst_offset = i * OS_H;
+        std::copy_n(src_p + src_offset, chunk_byte_size, dst_p + dst_offset);
+    }
+}
+
+void copy_columns_by_row_chunks(const ov::Tensor& src_full,
+                                      ov::Tensor& dst_full,
+                                const size_t kv_dim,
+                                const size_t start_pos,
+                                const size_t num_elements) {
+    auto src = make_tensor_slice(src_full, kv_dim, start_pos, start_pos + num_elements);
+    auto dst = make_tensor_slice(dst_full, kv_dim, 0u, num_elements);
+
+    const auto src_shape = src.get_shape();
+
+    OPENVINO_ASSERT(src_shape.size() == 4u);
+    OPENVINO_ASSERT(src_shape == dst.get_shape());
+    OPENVINO_ASSERT(src.get_byte_size() == dst.get_byte_size());
+
+    const auto src_strides = src.get_strides();
+    const auto dst_strides = dst.get_strides();
+    const auto elem_size   = src.get_byte_size() / src.get_size();
+
+    const auto C = src_shape[1];
+    const auto H = src_shape[2];
+    const auto W = src_shape[3];
+
+    const auto IS_H = src_strides[2];
+    const auto OS_H = dst_strides[2];
+
+    const size_t chunk_byte_size = W * elem_size;
+
+    const auto* src_p  = static_cast<uint8_t*>(src.data());
+          auto* dst_p  = static_cast<uint8_t*>(dst.data());
+
+    for (size_t i = 0; i < C*H; ++i) {
+        const size_t src_offset = i * IS_H;
+        const size_t dst_offset = i * OS_H;
+        std::copy_n(src_p + src_offset, chunk_byte_size, dst_p + dst_offset);
+    }
+}
+
+//void copy_to2(ov::Tensor   src_tensor,
+              //ov::Tensor   dst_tensor,
+              //const size_t kv_dim,
+              //const size_t src_start_pos,
+              //const size_t dst_start_pos,
+              //const size_t num_elements) {
+    //const auto src_shape = src_tensor.get_shape();
+    //const auto dst_shape = src_tensor.get_shape();
+    //const auto type_size = src_tensor.get_byte_size() / src_tensor.get_size();
+
+    //OPENVINO_ASSERT(src_shape.size() == 4u && dst_shape.size() == 4u);
+    //OPENVINO_ASSERT(src_tensor.get_element_type() == dst_tensor.get_element_type());
+
+    //const auto* src_tensor_data = reinterpret_cast<uint8_t*>(src_tensor.data());
+          //auto* dst_tensor_data = reinterpret_cast<uint8_t*>(dst_tensor.data());
+
+    //if (kv_dim == 2u) {
+        //const auto rows_stride = src_tensor.get_strides()[3];
+        //const auto channels_stride = src_tensor.get_strides()[2];
+        //// NB: Note, it can be only [batch, num_heads, seq_len, emb_size]
+        //OPENVINO_ASSERT(src_shape[0] == 1u);
+        //// NB: Position of the first row
+        //src_tensor_data += src_start_pos * rows_stride;
+        //dst_tensor_data += dst_start_pos * rows_stride;
+        //// NB: Perform continuous memory copy for every channel (head)
+        //for (size_t i = 0; i < src_shape[1u]; ++i) {
+            //std::copy_n(src_tensor_data, num_elements * type_size, dst_tensor_data);
+            //// NB: Go to the next channel
+            //dst_tensor_data += channels_stride;
+            //src_tensor_data += channels_stride;
+        //}
+    //} else if (kv_dim == 3u) {
+        //copy_columns_by_row_chunks(
+            //src_tensor, dst_tensor, kv_dim, src_start_pos, num_elements
+        //);
+    //} else {
+        //// NB: Default implementation
+        //auto src_tensor_slice = make_tensor_slice(
+            //src_tensor, kv_dim, src_start_pos, src_start_pos + num_elements
+        //);
+        //auto dst_tensor_slice = make_tensor_slice(
+            //dst_tensor, kv_dim, dst_start_pos, dst_start_pos + num_elements
+        //);
+        //src_tensor_slice.copy_to(dst_tensor_slice);
+    //}
+//}
 
 namespace opp = ov::pass::pattern;
 class TransposeValueTensors : public ov::pass::MatcherPass {
@@ -645,36 +830,6 @@ void set_npuw_cache_dir(ov::AnyMap& config) {
     }
 }
 
-void copy_columns_by_row_chunks(const ov::Tensor& src, ov::Tensor& dst) {
-    const auto src_shape = src.get_shape();
-
-    OPENVINO_ASSERT(src_shape.size() == 4u);
-    OPENVINO_ASSERT(src_shape == dst.get_shape());
-    OPENVINO_ASSERT(src.get_byte_size() == dst.get_byte_size());
-
-    const auto src_strides = src.get_strides();
-    const auto dst_strides = dst.get_strides();
-    const auto elem_size   = src.get_byte_size() / src.get_size();
-
-    const auto C = src_shape[1];
-    const auto H = src_shape[2];
-    const auto W = src_shape[3];
-
-    const auto IS_H = src_strides[2];
-    const auto OS_H = dst_strides[2];
-
-    const size_t chunk_byte_size = W * elem_size;
-
-    const auto* src_p  = static_cast<uint8_t*>(src.data());
-          auto* dst_p  = static_cast<uint8_t*>(dst.data());
-
-    for (size_t i = 0; i < C*H; ++i) {
-        const size_t src_offset = i * IS_H;
-        const size_t dst_offset = i * OS_H;
-        std::copy_n(src_p + src_offset, chunk_byte_size, dst_p + dst_offset);
-    }
-}
-
 } // anonymous namespace
 
 namespace ov {
@@ -770,31 +925,60 @@ void StaticLLMPipeline::setupAndCompileModels(
         9) Compile both models
     */
 
-    std::vector<uint16_t> row = { 1, 2, 3, 4, 5 };
-    std::vector<uint16_t> out(R * C, 0u);
+    //const int H = 5;
+    //const int S = 20;
+    //const int E = 64;
 
-    const int R = 7;
-    const int C = 5;
+    //std::vector<uint16_t> in_data (1*H*1*E, 2);
+    //std::vector<uint16_t> out_data(1*H*S*E, 0);
 
-    uint16_t* data = out.data();
-    for (int i = 0; i < R; ++i) {
-        for (int j = 0; j < C; ++j) {
-            std::cout << data[i * COL + j] << " ";
-        }
-        std::cout << std::endl;
-    }
-    std::cout << "\n\n" << std::endl;
+    //int channel_value = 7;
+    //for (int h = 0; h < H; ++h) {
+        //for (int i = 0; i < E; ++i) {
+            //in_data[h * E + i] = channel_value;
+        //}
+        //++channel_value;
+    //}
 
-    ov::Tensor src();
+    //std::cout << "in_data: " << std::endl;
+    //for (int h = 0; h < H; ++h) {
+        //std::cout << "plane: " << h << std::endl;
+        //for (int j = 0; j < E; ++j) {
+            //std::cout << in_data[h * E + j] << " ";
+        //}
+        //std::cout << std::endl;
+    //}
 
-    for (int i = 0; i < R; ++i) {
-        for (int j = 0; j < C; ++j) {
-            std::cout << data[i * COL + j] << " ";
-        }
-        std::cout << std::endl;
-    }
+    //ov::Tensor src(ov::element::f16, ov::Shape{1,H,1,E}, (void*)in_data.data());
+    //ov::Tensor dst(ov::element::f16, ov::Shape{1,H,S,E}, (void*)out_data.data());
 
-    throw 1;
+    //std::cout << "out_data: " << std::endl;
+    //for (int h = 0; h < H; ++h) {
+        //std::cout << "plane: " << h << std::endl;
+        //for (int i = 0; i < S; ++i) {
+            //for (int j = 0; j < E; ++j) {
+                //std::cout << out_data[h*E*S+i*E+j] << " ";
+            //}
+            //std::cout << std::endl;
+        //}
+        //std::cout << std::endl;
+    //}
+
+    //copy_by_rows(src, 0u, 16u, 1u, dst);
+
+    //std::cout << "out_data: " << std::endl;
+    //for (int h = 0; h < H; ++h) {
+        //std::cout << "plane: " << h << std::endl;
+        //for (int i = 0; i < S; ++i) {
+            //for (int j = 0; j < E; ++j) {
+                //std::cout << out_data[h*E*S+i*E+j] << " ";
+            //}
+            //std::cout << std::endl;
+        //}
+        //std::cout << std::endl;
+    //}
+
+    //throw 1;
 
     ov::Core core;
 
@@ -1100,31 +1284,49 @@ EncodedResults StaticLLMPipeline::generate(
 
     auto start_copy = std::chrono::steady_clock::now();
     ov::parallel_for(kvcache_compiled.outputs().size() - 1, [&](size_t i) {
-        const auto& output_name = kvcache_compiled.outputs()[kStartOutputKVCacheLayers + i].get_any_name();
-        const auto  input_name = std::regex_replace(output_name, std::regex("present"), "past_key_values");
+    //for (size_t i = 0; i < kvcache_compiled.outputs().size() - 1; ++i) {
+            const auto& output_name = kvcache_compiled.outputs()[kStartOutputKVCacheLayers + i].get_any_name();
+            const auto  input_name = std::regex_replace(output_name, std::regex("present"), "past_key_values");
 
-        const auto kv_dim = (output_name.find("value") != std::string::npos &&
-            m_kvcache_desc.v_tensors_transposed) ? 3u : m_kvcache_desc.seq_len;
+            const auto kv_dim = (output_name.find("value") != std::string::npos &&
+                    m_kvcache_desc.v_tensors_transposed) ? 3u : m_kvcache_desc.seq_len;
 
-        auto prefill_out_tensor = m_prefill_request.get_tensor(output_name);
-        auto prefill_out_slice = make_tensor_slice(
-            prefill_out_tensor, kv_dim, m_kvcache_desc.max_prompt_size - m_kvcache_desc.num_stored_tokens, m_kvcache_desc.max_prompt_size
-        );
+            auto prefill_out_tensor = m_prefill_request.get_tensor(output_name);
+            auto prefill_out_slice = make_tensor_slice(
+                prefill_out_tensor, kv_dim, m_kvcache_desc.max_prompt_size - m_kvcache_desc.num_stored_tokens, m_kvcache_desc.max_prompt_size
+            );
 
-        auto kvcache_in_tensor = m_kvcache_request.get_tensor(input_name);
-        fill_tensor<ov::float16>(kvcache_in_tensor, 0);
+            auto kvcache_in_tensor = m_kvcache_request.get_tensor(input_name);
+            fill_tensor<ov::float16>(kvcache_in_tensor, 0);
 
-        auto kvcache_in_slice = make_tensor_slice(
-            kvcache_in_tensor, kv_dim, 0u, m_kvcache_desc.num_stored_tokens
-        );
+            auto kvcache_in_slice = make_tensor_slice(
+                kvcache_in_tensor, kv_dim, 0u, m_kvcache_desc.num_stored_tokens
+            );
 
-        if (kv_dim == 3u) {
-            copy_columns_by_row_chunks(prefill_out_slice, kvcache_in_slice);
-        } else {
-            prefill_out_slice.copy_to(kvcache_in_slice);
-        }
+            const auto prefill_kvcache_start_pos = m_kvcache_desc.max_prompt_size - m_kvcache_desc.num_stored_tokens;
+
+            //if (kv_dim == 3u) {
+                //copy_columns_by_row_chunks(
+                    //prefill_out_tensor, kvcache_in_tensor, kv_dim,
+                    //prefill_kvcache_start_pos, m_kvcache_desc.num_stored_tokens
+                //);
+            //} else {
+                ////copy_by_rows(
+                    ////prefill_out_tensor, prefill_kvcache_start_pos, 0u,
+                    ////m_kvcache_desc.num_stored_tokens, kvcache_in_tensor
+                ////);
+                //prefill_out_slice.copy_to(kvcache_in_slice);
+            //}
+			if (kv_dim == 3u) {
+				copy_columns_by_row_chunks(prefill_out_slice, kvcache_in_slice);
+			} else {
+				prefill_out_slice.copy_to(kvcache_in_slice);
+			}
+    //}
     });
+
     auto end_copy = std::chrono::steady_clock::now();
+
     double prefill_kv_copy =
         std::chrono::duration_cast<std::chrono::microseconds>(end_copy - start_copy).count() / 1000.0;
 
@@ -1180,11 +1382,17 @@ EncodedResults StaticLLMPipeline::generate(
             const auto kv_dim = (output_name.find("value") != std::string::npos &&
                 m_kvcache_desc.v_tensors_transposed) ? 3u : m_kvcache_desc.seq_len;
 
+            auto kvcache_out_tensor = m_kvcache_request.get_tensor(output_name);
             auto kvcache_in_tensor = m_kvcache_request.get_tensor(input_name);
             auto out_tensor = m_kvcache_request.get_tensor(output_name);
 
-            copy_to(out_tensor, kvcache_in_tensor, kv_dim, m_kvcache_desc.num_stored_tokens);
+            //copy_to(out_tensor, kvcache_in_tensor, kv_dim, m_kvcache_desc.num_stored_tokens - 1);
+            auto kvcache_in_slice = make_tensor_slice(
+                kvcache_in_tensor, kv_dim, m_kvcache_desc.num_stored_tokens - 1, m_kvcache_desc.num_stored_tokens
+            );
+			m_kvcache_request.get_tensor(output_name).copy_to(kvcache_in_slice);
         }
+
         auto end_copy = std::chrono::steady_clock::now();
         double kv_copy =
             std::chrono::duration_cast<std::chrono::microseconds>(end_copy - start_copy).count() / 1000.0;
@@ -1194,7 +1402,7 @@ EncodedResults StaticLLMPipeline::generate(
 
     auto total_avg_latency = total_sum / num_iters;
 
-    std::cout << "num_iters: " << num_iters << std::endl;
+    std::cout << "\n\nnum_iters: " << num_iters << std::endl;
     std::cout << "total sum: " << total_sum << "ms" << std::endl;
     std::cout << "total_avg_latency: " << total_avg_latency << "ms" << std::endl;
 
