@@ -724,7 +724,6 @@ std::shared_ptr<ov::CompiledModel> StatefulLLMPipeline::setupAndCompileModel(
     const uint32_t kMaxPromptLen = pop_int_and_cast(pipeline_config, "MAX_PROMPT_LEN").value_or(1024u);
     const uint32_t kMinResponseLen = pop_int_and_cast(pipeline_config, "MIN_RESPONSE_LEN").value_or(128u);
     m_kvcache_total = kMaxPromptLen + kMinResponseLen;
-    std::string generate_hint = pop_or_default<std::string>(pipeline_config, "GENERATE_HINT", "FAST_COMPILE");
 
     update_config(pipeline_config, {"NPU_USE_NPUW", "YES"});
     update_config(pipeline_config, {"NPUW_LLM", "YES"});
@@ -735,10 +734,10 @@ std::shared_ptr<ov::CompiledModel> StatefulLLMPipeline::setupAndCompileModel(
 
     update_config(pipeline_config, {"NPUW_LLM_MAX_PROMPT_LEN", kMaxPromptLen});
     update_config(pipeline_config, {"NPUW_LLM_MIN_RESPONSE_LEN", kMinResponseLen});
-    update_config(pipeline_config, {"NPUW_LLM_GENERATE_HINT", generate_hint});
 
     rename_key(pipeline_config, "PREFILL_CONFIG", "NPUW_LLM_PREFILL_CONFIG");
     rename_key(pipeline_config, "GENERATE_CONFIG", "NPUW_LLM_GENERATE_CONFIG");
+    rename_key(pipeline_config, "GENERATE_HINT", "NPUW_LLM_GENERATE_HINT");
 
     // Replace CACHE_DIR option if NPUW is enabled
     set_npuw_cache_dir(pipeline_config);
