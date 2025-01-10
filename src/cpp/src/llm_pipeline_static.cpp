@@ -209,10 +209,16 @@ std::shared_ptr<ov::Model> cvt_value_tensors_layout(std::shared_ptr<ov::Model> m
     return ppp.build();
 }
 
-bool optimize_value_tensors(std::shared_ptr<ov::Model> model) {
+void unroll_sdpa(std::shared_ptr<ov::Model> model) {
     ov::pass::GraphRewrite rewr;
     rewr.add_matcher<ScaledDotProductAttentionDecomposition>();
+    rewr.run_on_model(model);
+    ov::pass::Validate().run_on_model(model);
+}
+
+bool optimize_value_tensors(std::shared_ptr<ov::Model> model) {
     TransposeValueTensors::Context ctx;
+    ov::pass::GraphRewrite rewr;
     rewr.add_matcher<TransposeValueTensors>(std::ref(ctx));
     rewr.run_on_model(model);
 
@@ -731,12 +737,6 @@ std::shared_ptr<ov::CompiledModel> StatefulLLMPipeline::setupAndCompileModel(
     update_config(pipeline_config, {"NPUW_LLM_MIN_RESPONSE_LEN", kMinResponseLen});
     update_config(pipeline_config, {"NPUW_LLM_GENERATE_HINT", generate_hint});
 
-    // NB: Try to apply opt transpose only for Llama-2-7b-chat-hf model
-    if ( model_desc.name_or_path == "meta-llama/Llama-2-7b-chat-hf" ||
-        (model_desc.type == "llama" && model_desc.num_key_value_heads == 32)) {
-            update_config(pipeline_config, {"NPUW_LLM_OPTIMIZE_V_TENSORS", true});
-    }
-
     rename_key(pipeline_config, "PREFILL_CONFIG", "NPUW_LLM_PREFILL_CONFIG");
     rename_key(pipeline_config, "GENERATE_CONFIG", "NPUW_LLM_GENERATE_CONFIG");
 
@@ -1040,15 +1040,13 @@ void StatelessLLMPipeline::setupAndCompileModels(
     m_kvcache_desc = KVCacheDesc { kMaxPromptLen, kMaxPromptLen + kMinResponseLen, 0u, axes.seq_len, false};
     reshape_to_static(prefill_model, m_kvcache_desc.max_prompt_size, m_kvcache_desc.max_prompt_size, axes);
     reshape_to_static(kvcache_model, 1u, m_kvcache_desc.total_size, axes);
+
     // (6) Apply opt layout if applicable
-    // NB: Try to apply opt transpose only for Llama-2-7b-chat-hf model
-    if ( model_desc.name_or_path == "meta-llama/Llama-2-7b-chat-hf" ||
-        (model_desc.type == "llama" && model_desc.num_key_value_heads == 32)) {
-        if (optimize_value_tensors(kvcache_model)) {
-            // NB: Check if TransposeValueTensors transformation was applied
-            m_kvcache_desc.v_tensors_transposed = true;
-            prefill_model = cvt_value_tensors_layout(prefill_model);
-        }
+    unroll_sdpa(kvcache_model);
+    if (optimize_value_tensors(kvcache_model)) {
+        // NB: Check if TransposeValueTensors transformation was applied
+        m_kvcache_desc.v_tensors_transposed = true;
+        prefill_model = cvt_value_tensors_layout(prefill_model);
     }
     // (7) Replace KV-cache tensors for the entire cache to tensors only for new token (before concat)
     kvcache_model = redirect_new_kv_to_output(kvcache_model);
